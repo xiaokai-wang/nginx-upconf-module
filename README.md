@@ -34,8 +34,6 @@ Synopsis
 ```nginx
 http {
     upstream test {
-        upconf_dump_path /usr/local/nginx/conf/servers/servers_test.conf;
-
         server 127.0.0.1:8089 weight=1, fail_timeout=10, max_fails=3;
     }
 
@@ -56,6 +54,7 @@ http {
 
         location = /upstream_conf {
             upstream_conf;
+            upconf_dump_path /usr/local/nginx/conf/servers;
         }
 
     }
@@ -103,9 +102,9 @@ upconf_dump_path
 -----------
 `syntax: upconf_dump_path $path`
 
-default: /usr/local/nginx/conf/servers/servers_$host.conf
+default: /tmp
 
-context: upstream
+context: location
 
 description: dump the upstream backends to the $path.
 
