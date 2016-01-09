@@ -17,7 +17,6 @@ Table of Contents
 * [Directives](#functions)
     * [upstream_conf](#upstream_conf)
     * [upconf_dump_path](#upconf_dump_path)
-    * [upstream_show](#upstream_show)
 * [Compatibility](#compatibility)
 * [Installation](#installation)
 * [Author](#author)
@@ -57,10 +56,6 @@ http {
 
         location = /upstream_conf {
             upstream_conf;
-        }
-
-        location = /upstream_show {
-            upstream_show;
         }
 
     }
