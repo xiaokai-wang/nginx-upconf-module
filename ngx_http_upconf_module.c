@@ -9,8 +9,43 @@
 #include <ngx_config.h>
 
 
+#define NGX_DELAY_DELETE 75 * 1000
+
+#define NGX_HTTP_UPCONF_OP_LIST   0
+#define NGX_HTTP_UPCONF_OP_ADD    1
+#define NGX_HTTP_UPCONF_OP_REMOVE 2
+#define NGX_HTTP_UPCONF_OP_BACKUP 4
+#define NGX_HTTP_UPCONF_OP_PARAM  8
+
+
+#define NGX_HTTP_UPCONF_WEIGHT       1
+#define NGX_HTTP_UPCONF_MAX_FAILS    2
+#define NGX_HTTP_UPCONF_FAIL_TIMEOUT 4
+#define NGX_HTTP_UPCONF_UP           8
+#define NGX_HTTP_UPCONF_DOWN         16
+
+
+static const ngx_str_t ngx_http_upconf_params[] = {
+    ngx_string("arg_upstream"),
+    ngx_string("arg_verbose"),
+    ngx_string("arg_add"),
+    ngx_string("arg_remove"),
+    ngx_string("arg_backup"),
+    ngx_string("arg_server"),
+    ngx_string("arg_weight"),
+    ngx_string("arg_max_fails"),
+    ngx_string("arg_fail_timeout"),
+    ngx_string("arg_up"),
+    ngx_string("arg_down")
+};
+
+
 typedef struct {
-    ngx_str_t            method;
+    ngx_int_t            op;
+    ngx_int_t            op_params;
+    ngx_int_t            verbose;
+    ngx_int_t            status;
+
     ngx_str_t            ip_port;
     ngx_str_t            upstream;
 
@@ -30,6 +65,16 @@ typedef struct {
 } ngx_http_upconf_loc_conf_t;
 
 
+typedef struct {
+    ngx_event_t                              delay_delete_ev;
+
+    time_t                                   start_sec;
+    ngx_msec_t                               start_msec;
+
+    void                                    *data;
+} ngx_delay_event_t;
+
+
 #if (NGX_HTTP_UPSTREAM_CHECK)
 
 extern ngx_uint_t ngx_http_upstream_check_add_dynamic_peer(ngx_pool_t *pool,
@@ -44,7 +89,7 @@ static char *ngx_http_upconf_set(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_upconf_handler(ngx_http_request_t *r);
 static void ngx_http_upconf_init(ngx_http_request_t *r);
-static ngx_int_t ngx_http_upconf_parse_args(ngx_http_request_t *r, 
+static ngx_int_t ngx_http_upconf_build_op(ngx_http_request_t *r, 
     ngx_http_server_t *server);
 static ngx_int_t ngx_http_upconf_add_peer(ngx_http_request_t *r, 
     ngx_http_server_t *server);
@@ -69,7 +114,8 @@ static ngx_int_t ngx_http_upconf_init_peers(ngx_cycle_t *cycle,
 static ngx_int_t ngx_http_upconf_parse_dump_file(
     ngx_http_upstream_srv_conf_t *uscf, u_char * server_file);
 
-void ngx_http_upconf_finalize_request(ngx_http_request_t *r);
+void ngx_http_upconf_finalize_request(ngx_http_request_t *r, 
+    ngx_http_server_t *server);
 
 
 static ngx_command_t  ngx_http_upconf_commands[] = {
@@ -168,11 +214,11 @@ ngx_http_upconf_init(ngx_http_request_t *r)
 {
     ngx_http_server_t                  server;
 
-    if (ngx_http_upconf_parse_args(r, &server) != NGX_OK) {
+    if (ngx_http_upconf_build_op(r, &server) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERROR, r->connection->log, 0,
                       "upconf_init: args invalid \"%V\"", &r->args);
 
-        ngx_http_upconf_finalize_request(r, NGX_ERROR);
+        ngx_http_upconf_finalize_request(r, &server);
 
         return;
     }
@@ -185,7 +231,7 @@ ngx_http_upconf_init(ngx_http_request_t *r)
                                      &server) != NGX_OK) 
         {
 
-            ngx_http_upconf_finalize_request(r, NGX_ERROR);
+            ngx_http_upconf_finalize_request(r, &server);
 
             return;
         }
@@ -195,7 +241,7 @@ ngx_http_upconf_init(ngx_http_request_t *r)
                                         &server) != NGX_OK) 
         {
 
-            ngx_http_upconf_finalize_request(r, NGX_ERROR);
+            ngx_http_upconf_finalize_request(r, &server);
 
             return;
         }
@@ -205,7 +251,7 @@ ngx_http_upconf_init(ngx_http_request_t *r)
                                         &server) != NGX_OK) 
         {
 
-            ngx_http_upconf_finalize_request(r, NGX_ERROR);
+            ngx_http_upconf_finalize_request(r, &server);
 
             return;
         }
@@ -218,248 +264,150 @@ ngx_http_upconf_init(ngx_http_request_t *r)
 
     } else {
 
-        ngx_http_upconf_finalize_request(r, NGX_ERROR);
+        ngx_http_upconf_finalize_request(r, &server);
 
         return;
     }
 
-    ngx_http_upconf_finalize_request(r, NGX_OK);
+    ngx_http_upconf_finalize_request(r, &server);
     return;
 }
 
 
-static ngx_int_t
-ngx_http_upconf_parse_args(ngx_http_request_t *r, ngx_http_server_t *server)
+ngx_int_t
+ngx_http_upconf_build_op(ngx_http_request_t *r, ngx_http_server_t *server)
 {
-    u_char         *args_p, *args_n, *args_end;
-    ngx_int_t       weight, max_fails, fail_timeout, down, backup;
+    size_t                      args_size;
+    u_char                     *low;
+    ngx_str_t                  *args;
+    ngx_uint_t                  i;
+    ngx_uint_t                  key;
+    ngx_http_variable_value_t  *var;
 
-    ngx_str_null(server->method);
-    ngx_str_null(server->ip_port);
-    ngx_str_null(server->upstream);
+    ngx_memzero(server, sizeof(ngx_http_server_t));
 
+    /* default setting for op */
+    server->op = NGX_HTTP_UPCONF_OP_LIST;
+    server->status = NGX_HTTP_OK;
+    ngx_str_null(&server->upstream);
     server->weight = 1;
-    server->max_fails = 2;
+    server->max_fails = 1;
     server->fail_timeout = 10;
 
-    server->down = 0;
-    server->backup = 0;
+    args = (ngx_str_t *)&ngx_http_upconf_params;
+    args_size = sizeof(ngx_http_upconf_params) / sizeof(ngx_str_t);
+    for (i=0; i < args_size; i++) {
 
-    args_p = r->args.data;
-    args_end = r->args.data + r->args.len;
-    while (args_p != NULL) {
-
-        if (*args_p == '&') {
-            args_n = args_p + 1;
-
-        } else {
-            args_n = args_p;
+        low = ngx_pnalloc(r->pool, args[i].len);
+        if (low == NULL) {
+            server->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "upconf_build_op: failed to allocate memory");
+            return NGX_ERROR;
         }
 
-        if (ngx_strncmp(args_n, "add=", 4) == 0) {
+        key = ngx_hash_strlow(low, args[i].data, args[i].len);
+        var = ngx_http_get_variable(r, &args[i], key);
 
-            server->method.len = 3;
-            server->method.data = ngx_pcalloc(r->pool, 4);
-            if (server->method.data == NULL) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
-                              "upconf_parse_args: memory alloc error");
-                return NGX_ERROR;
+        if (!var->not_found) {
+            if (ngx_strcmp("arg_upstream", args[i].data) == 0) {
+                server->upstream.data = var->data;
+                server->upstream.len = var->len;
+
+            } else if (ngx_strcmp("arg_verbose", args[i].data) == 0) {
+                server->verbose = 1;
+
+            } else if (ngx_strcmp("arg_add", args[i].data) == 0) {
+                server->op |= NGX_HTTP_UPCONF_OP_ADD;
+
+            } else if (ngx_strcmp("arg_remove", args[i].data) == 0) {
+                server->op |= NGX_HTTP_UPCONF_OP_REMOVE;
+
+            } else if (ngx_strcmp("arg_backup", args[i].data) == 0) {
+                server->backup = 1;
+
+            } else if (ngx_strcmp("arg_server", args[i].data) == 0) {
+                server->ip_port.data = var->data;
+                server->ip_port.len = var->len;
+
+            } else if (ngx_strcmp("arg_weight", args[i].data) == 0) {
+                server->weight = ngx_atoi(var->data, var->len);
+                if (server->weight == NGX_ERROR) {
+                    server->status = NGX_HTTP_BAD_REQUEST;
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "upconf_build_op: weight is invalid");
+                    return NGX_ERROR;
+                }
+
+                server->op |= NGX_HTTP_UPCONF_OP_PARAM;
+                server->op_param |= NGX_HTTP_UPCONF_WEIGHT;
+                server->verbose = 1;
+
+            } else if (ngx_strcmp("arg_max_fails", args[i].data) == 0) {
+                op->max_fails = ngx_atoi(var->data, var->len);
+                if (op->max_fails == NGX_ERROR) {
+                    op->status = NGX_HTTP_BAD_REQUEST;
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "upconf_build_op: max_fails is invalid");
+                    return NGX_ERROR;
+                }
+
+                server->op |= NGX_HTTP_UPCONF_OP_PARAM;
+                server->op_param |= NGX_HTTP_UPCONF_MAX_FAILS;
+                server->verbose = 1;
+
+            } else if (ngx_strcmp("arg_fail_timeout", args[i].data) == 0) {
+                op->fail_timeout = ngx_atoi(var->data, var->len);
+                if (op->fail_timeout == NGX_ERROR) {
+                    op->status = NGX_HTTP_BAD_REQUEST;
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "upconf_build_op: fail_timeout is invalid");
+                    return NGX_ERROR;
+                }
+
+                server->op |= NGX_HTTP_UPCONF_OP_PARAM;
+                server->op_param |= NGX_HTTP_UPCONF_FAIL_TIMEOUT;
+                server->verbose = 1;
+
+            } else if (ngx_strcmp("arg_up", args[i].data) == 0) {
+                server->up = 1;
+                server->op |= NGX_HTTP_UPCONF_OP_PARAM;
+                server->op_param |= NGX_HTTP_UPCONF_UP;
+                server->verbose = 1;
+
+            } else if (ngx_strcmp("arg_down", args[i].data) == 0) {
+                server->down = 1;
+                server->op |= NGX_HTTP_UPCONF_OP_PARAM;
+                server->op_param |= NGX_HTTP_UPCONF_DOWN;
+                server->verbose = 1;
+                
             }
-            ngx_memmove(server->method.data, "add", 3);
-
-            args_p = ngx_strchr((char *)args_n, '&');
-
-            continue;
         }
+    }
 
-        if (ngx_strncmp(args_n, "remove=", 7) == 0) {
+    /* can not add and remove at once */
+    if ((server->op & NGX_HTTP_UPCONF_OP_ADD) &&
+        (server->op & NGX_HTTP_UPCONF_OP_REMOVE))
+    {
+        server->status = NGX_HTTP_BAD_REQUEST;
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upconf_build_op: add and remove at once are not allowed");
+        return NGX_ERROR;
+    }
 
-            server->method.len = 6;
-            server->method.data = ngx_pcalloc(r->pool, 7);
-            if (server->method.data == NULL) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
-                              "upconf_parse_args: memory alloc error");
-                return NGX_ERROR;
-            }
-            ngx_memmove(server->method.data, "remove", 6);
- 
-            args_p = ngx_strchr((char *)args_n, '&');
+    if (server->op & NGX_HTTP_UPCONF_OP_ADD) {
+        server->op = NGX_HTTP_UPCONF_OP_ADD;
 
-            continue;
-        }
+    } else if (server->op & NGX_HTTP_UPCONF_OP_REMOVE) {
+        server->op = NGX_HTTP_UPCONF_OP_REMOVE;
+    }
 
-        if (ngx_strncmp(args_n, "update=", 7) == 0) {
-
-            server->method.len = 6;
-            server->method.data = ngx_pcalloc(r->pool, 7);
-            if (server->method.data == NULL) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
-                              "upconf_parse_args: memory alloc error");
-                return NGX_ERROR;
-            }
-            ngx_memmove(server->method.data, "update", 6);
- 
-            args_p = ngx_strchr((char *)args_n, '&');
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "upstream=", 9) == 0) {
- 
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                server->upstream.len = args_p - args_n + 9;
-
-            } else {
-                server->upstream.len = args_end - args_n + 9;
-            }
-
-            server->upstream.data = ngx_pcalloc(r->pool, server->upstream.len);
-            if (server->upstream.data == NULL) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
-                              "upconf_parse_args: memory alloc error");
-                return NGX_ERROR;
-            }
-            ngx_memmove(server->upstream.data, args_n + 9, server->upstream.len);
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "server=", 7) == 0) {
- 
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                server->ip_port.len = args_p - args_n + 7;
-
-            } else {
-                server->ip_port.len = args_end - args_n + 7;
-            }
-
-            server->ip_port.data = ngx_pcalloc(r->pool, server->ip_port.len);
-            if (server->ip_port.data == NULL) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
-                              "upconf_parse_args: memory alloc error");
-                return NGX_ERROR;
-            }
-            ngx_memmove(server->ip_port.data, args_n + 7, server->ip_port.len);
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "weight=", 7) == 0) {
-
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                weight = ngx_atoi(args_n + 7, args_p - args_n + 7);
-
-            } else {
-                weight = ngx_atoi(args_n + 7, args_end - args_n + 7);
-            }
-
-            if (weight >= 1) {
-                server->weight = weight;
-
-            } else {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upconf_parse_args: invalid weight \"%V\"", 
-                              &r->args);
-                return NGX_ERROR;
-            }
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "max_fails=", 10) == 0) {
-
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                max_fails = ngx_atoi(args_n + 10, args_p - args_n + 10);
-
-            } else {
-                max_fails = ngx_atoi(args_n + 10, args_end - args_n + 10);
-            }
-
-            if (max_fails >= 0) {
-                server->max_fails = max_fails;
-
-            } else {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upconf_parse_args: invalid max_fails \"%V\"", 
-                              &r->args);
-                return NGX_ERROR;
-            }
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "fail_timeout=", 13) == 0) {
-
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                fail_timeout = ngx_atoi(args_n + 13, args_p - args_n + 13);
-            } else {
-                fail_timeout = ngx_atoi(args_n + 13, args_end - args_n + 13);
-            }
-
-            if (fail_timeout >= 0) {
-                server->fail_timeout = fail_timeout;
-
-            } else {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upconf_parse_args: invalid fail_timeout \"%V\"", 
-                              &r->args);
-                return NGX_ERROR;
-            }
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "down=", 5) == 0) {
-
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                down = ngx_atoi(args_n + 5, args_p - args_n + 5);
-            } else {
-                down = ngx_atoi(args_n + 5, args_end - args_n + 5);
-            }
-
-            if (down != 0 && down != 1) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upconf_parse_args: invalid down \"%V\"", 
-                              &r->args);
-                return NGX_ERROR;
-
-            } else {
-                server->down = down;
-            }
-
-            continue;
-        }
-
-        if (ngx_strncmp(args_n, "backup=", 7) == 0) {
-
-            args_p = ngx_strchr((char *)args_n, '&');
-            if (args_p != NULL) {
-                backup = ngx_atoi(args_n + 7, args_p - args_n + 7);
-            } else {
-                backup = ngx_atoi(args_n + 7, args_end - args_n + 7);
-            }
-
-            if (backup != 0 && backup != 1) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upconf_parse_args: invalid backup \"%V\"", 
-                              &r->args);
-                return NGX_ERROR;
-
-            } else {
-                server->backup = backup;
-            }
-
-            continue;
-        }
-
-
-        args_p = ngx_strchr((char *)args_n, '&');
+    /* can not up and down at once */
+    if (server->up && server->down) {
+        server->status = NGX_HTTP_BAD_REQUEST;
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upconf_build_op: down and up at once are not allowed");
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -749,7 +697,6 @@ ngx_http_upconf_event_init(ngx_http_upstream_rr_peers_t *tmp_peers,
         delay_event->delay_delete_ev.data = delay_event;
         delay_event->delay_delete_ev.timer_set = 0;
 
-        ngx_queue_insert_head(&upstream_host->add_ev, &delay_event->queue);
     } else {
 
         delay_event->delay_delete_ev.handler = ngx_http_upconf_remove_delay_del;
@@ -757,7 +704,6 @@ ngx_http_upconf_event_init(ngx_http_upstream_rr_peers_t *tmp_peers,
         delay_event->delay_delete_ev.data = delay_event;
         delay_event->delay_delete_ev.timer_set = 0;
 
-        ngx_queue_insert_head(&upstream_host->delete_ev, &delay_event->queue);
     }
 
     delay_event->data = tmp_peers;
@@ -775,9 +721,13 @@ ngx_http_upconf_add_delay_del(ngx_event_t *event)
     ngx_delay_event_t             *delay_event;
     ngx_http_request_t            *r=NULL;
     ngx_http_log_ctx_t            *ctx=NULL;
-    ngx_http_upconf_rr_peers_t  *tmp_peers=NULL, *tmp_backup=NULL;
+    ngx_http_upconf_rr_peers_t    *tmp_peers=NULL;
 
     delay_event = event->data;
+    if (delay_event == NULL) {
+        return;
+    }
+    tmp_peers = delay_event->data;
 
     c = ngx_cycle->connections;
     for (i = 0; i < ngx_cycle->connection_n; i++) {
@@ -808,24 +758,13 @@ ngx_http_upconf_add_delay_del(ngx_event_t *event)
         }
     }
 
-    tmp_peers = delay_event->data;
-    tmp_backup = tmp_peers->next;
-
     if (tmp_peers != NULL) {
 
         ngx_free(tmp_peers);
         tmp_peers = NULL;
     }
 
-    if (tmp_backup && tmp_backup->number > 0) {
- 
-        ngx_free(tmp_backup);
-        tmp_backup = NULL;
-    }
-
-    ngx_queue_remove(&delay_event->queue);
     ngx_free(delay_event);
-
     delay_event = NULL;
 
     return;
@@ -835,17 +774,20 @@ ngx_http_upconf_add_delay_del(ngx_event_t *event)
 static void
 ngx_http_upconf_remove_delay_del(ngx_event_t *event)
 {
-    ngx_uint_t                    i;
+    ngx_uint_t                     i;
     ngx_connection_t              *c;
     ngx_delay_event_t             *delay_event;
     ngx_http_request_t            *r=NULL;
     ngx_http_log_ctx_t            *ctx=NULL;
-    ngx_http_upconf_rr_peers_t  *tmp_peers=NULL;
+    ngx_http_upconf_rr_peers_t    *tmp_peers=NULL;
 
     u_char *namep = NULL;
     struct sockaddr *saddr = NULL;
 
     delay_event = event->data;
+    if (delay_event == NULL) {
+        return;
+    }
     tmp_peers = delay_event->data;
 
     c = ngx_cycle->connections;
@@ -906,10 +848,7 @@ ngx_http_upconf_remove_delay_del(ngx_event_t *event)
         tmp_peers = NULL;
     }
 
-
-    ngx_queue_remove(&delay_event->queue);
     ngx_free(delay_event);
-
     delay_event = NULL;
 
     return;
@@ -1334,13 +1273,14 @@ ngx_http_upconf_parse_dump_file(ngx_http_upstream_srv_conf_t *uscf,
 
 
 void
-ngx_http_upconf_finalize_request(ngx_http_request_t *r)
+ngx_http_upconf_finalize_request(ngx_http_request_t *r, 
+    ngx_http_server_t *server)
 {
     ngx_int_t                              len;
     ngx_buf_t                             *b = NULL;
 
     ngx_log_debug0(NGX_LOG_DEBUG, r->connection->log, 0, 
-                               "upstream add succeed finalize_success");
+                   "upconf_finalize_request: upstream finalize_success");
 
     len = ngx_strlen(add_succeed);
 
