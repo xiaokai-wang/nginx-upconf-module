@@ -92,15 +92,16 @@ static void ngx_http_upconf_init(ngx_http_request_t *r);
 static ngx_int_t ngx_http_upconf_build_op(ngx_http_request_t *r, 
     ngx_http_server_t *server);
 static ngx_int_t ngx_http_upconf_add_peer(ngx_http_request_t *r, 
-    ngx_http_server_t *server);
+    ngx_http_server_t *server, ngx_http_upstream_srv_conf_t *uscf);
 static ngx_int_t ngx_http_upconf_update_peer(ngx_http_request_t *r, 
-    ngx_http_server_t *server);
+    ngx_http_server_t *server, ngx_http_upstream_srv_conf_t *uscf);
 static ngx_int_t ngx_http_upconf_remove_peer(ngx_http_request_t *r, 
-    ngx_http_server_t *server)
+    ngx_http_server_t *server, ngx_http_upstream_srv_conf_t *uscf);
 
 static ngx_int_t ngx_http_upconf_check_server(
     ngx_http_upstream_srv_conf_t *uscf, ngx_str_t *ip_port);
-static void *ngx_http_upconf_lookup_upstream(ngx_str_t *upstream_name);
+static void *ngx_http_upconf_lookup_upstream(ngx_http_request_t *r, 
+    ngx_http_server_t *server);
 static void *ngx_http_upconf_server(ngx_http_request_t *r, 
     ngx_http_server_t *server);
 
@@ -213,6 +214,7 @@ static void
 ngx_http_upconf_init(ngx_http_request_t *r)
 {
     ngx_http_server_t                  server;
+    ngx_http_upstream_srv_conf_t      *uscf;
 
     if (ngx_http_upconf_build_op(r, &server) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERROR, r->connection->log, 0,
@@ -226,50 +228,17 @@ ngx_http_upconf_init(ngx_http_request_t *r)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "upconf_init: parse args succeed");
 
-    if (ngx_strncmp(server.method.data, "add", server.method.len) == 0){
-        if (ngx_http_upconf_add_peer((ngx_cycle_t *)ngx_cycle, 
-                                     &server) != NGX_OK) 
-        {
-
-            ngx_http_upconf_finalize_request(r, &server);
-
-            return;
-        }
-
-    } else if (ngx_strncmp(server.method.data, "remove", server.method.len) == 0){
-        if (ngx_http_upconf_remove_peer((ngx_cycle_t *)ngx_cycle, 
-                                        &server) != NGX_OK) 
-        {
-
-            ngx_http_upconf_finalize_request(r, &server);
-
-            return;
-        }
-
-    } else if (ngx_strncmp(server.method.data, "update", server.method.len) == 0){
-        if (ngx_http_upconf_update_peer((ngx_cycle_t *)ngx_cycle, 
-                                        &server) != NGX_OK) 
-        {
-
-            ngx_http_upconf_finalize_request(r, &server);
-
-            return;
-        }
-
-    } else if (server.upstream.data != NULL && server.upstream.len != 0) {
-
-        ngx_http_upconf_upstream_show(&server.upstream);
-
-        return;
-
-    } else {
-
-        ngx_http_upconf_finalize_request(r, &server);
-
-        return;
+    if ((uscf = ngx_http_upconf_lookup_upstream(r, &server)) == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upconf_init: upstream \"%V\" not exist", 
+                      &server->upstream);
+        return NGX_ERROR;
     }
 
+    server.status = ngx_http_upconf_op(r, &server, uscf);
+
     ngx_http_upconf_finalize_request(r, &server);
+
     return;
 }
 
@@ -414,17 +383,44 @@ ngx_http_upconf_build_op(ngx_http_request_t *r, ngx_http_server_t *server)
 }
 
 
+ngx_int_t
+ngx_http_upconf_op(ngx_http_request_t *r, ngx_http_server_t *server,
+    ngx_http_upstream_srv_conf_t *uscf)
+{
+    ngx_int_t  rc;
+
+    switch (server->op) {
+
+        case NGX_HTTP_UPCONF_OP_ADD:
+            rc = ngx_http_upconf_add_peer(r, server, uscf);
+            break;
+
+        case NGX_HTTP_UPCONF_OP_REMOVE:
+            rc = ngx_http_upconf_remove_peer(r, server, uscf);
+            break;
+
+        case NGX_HTTP_UPCONF_OP_PARAM:
+            rc = ngx_http_upconf_update_peer(r, server, uscf);
+            break;
+
+        case NGX_HTTP_UPCONF_OP_LIST:
+            default:
+                rc = NGX_OK;
+            break;
+    }
+
+    return rc;
+}
+
+
 static ngx_int_t
-ngx_http_upconf_add_peer(ngx_http_request_t *r, ngx_http_server_t *server)
+ngx_http_upconf_add_peer(ngx_http_request_t *r, ngx_http_server_t *server, 
+    ngx_http_upstream_srv_conf_t *uscf)
 {
     ngx_uint_t                             n, w;
     ngx_http_upstream_server_t            *upstream_server;
     ngx_http_upstream_rr_peers_t          *peers=NULL, tmp_peers=NULL;
     ngx_http_upstream_srv_conf_t          *uscf;
-
-    if ((uscf = ngx_http_upconf_lookup_upstream(&server->upstream)) == NULL) {
-        return NGX_ERROR;
-    }
 
     if (ngx_http_upconf_check_server(uscf, &server->ip_port) != -1) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -504,16 +500,13 @@ invalid:
 
 
 static ngx_int_t
-ngx_http_upconf_update_peer(ngx_cycle_t *cycle, ngx_channel_t *ch)
+ngx_http_upconf_update_peer(ngx_http_request_t *r, ngx_http_server_t *server, 
+    ngx_http_upstream_srv_conf_t *uscf)
 {
     ngx_uint_t                             n, w, index;
     ngx_http_upstream_server_t            *upstream_server;
     ngx_http_upstream_rr_peers_t          *peers=NULL;
     ngx_http_upstream_srv_conf_t          *uscf;
-
-    if ((uscf = ngx_http_upconf_lookup_upstream(&server->upstream)) == NULL) {
-        return NGX_ERROR;
-    }
 
     if ((index = ngx_http_upconf_check_server(uscf, &server->ip_port)) == -1) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -544,16 +537,13 @@ ngx_http_upconf_update_peer(ngx_cycle_t *cycle, ngx_channel_t *ch)
 
 
 static ngx_int_t
-ngx_http_upconf_remove_peer(ngx_http_request_t *r, ngx_http_server_t *server)
+ngx_http_upconf_remove_peer(ngx_http_request_t *r, ngx_http_server_t *server,
+    ngx_http_upstream_srv_conf_t *uscf)
 {
     ngx_uint_t                             i, n, w, index;
     ngx_http_upstream_server_t            *upstream_server;
     ngx_http_upstream_rr_peers_t          *peers=NULL, tmp_peers=NULL;
     ngx_http_upstream_srv_conf_t          *uscf;
-
-    if ((uscf = ngx_http_upconf_lookup_upstream(&server->upstream)) == NULL) {
-        return NGX_ERROR;
-    }
 
     if ((index = ngx_http_upconf_check_server(uscf, &server->ip_port)) == -1) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -942,12 +932,13 @@ invalid:
 
 
 static void *
-ngx_http_upconf_lookup_upstream(ngx_str_t *upstream_name)
+ngx_http_upconf_lookup_upstream(ngx_http_request_t *r, 
+    ngx_http_server_t *server)
 {
     ngx_http_upstream_srv_conf_t         **uscfp, *uscf;
     ngx_http_upstream_main_conf_t         *umcf;
 
-    umcf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_module);
+    umcf  = ngx_http_get_module_main_conf(r, ngx_http_upstream_module);
 
     uscfp = umcf->upstreams.elts;
     for (i = 0; i < umcf->upstreams.nelts; i++) {
@@ -956,17 +947,11 @@ ngx_http_upconf_lookup_upstream(ngx_str_t *upstream_name)
             && ngx_strncasecmp(uscfp[i]->host.data, upstream_name->data, 
                uscfp[i]->host.len) == 0)
         {
-            break;
+            return uscfp[i];
         }
     }
 
-    if (i == umcf->upstreams.nelts) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upconf_lookup_upstream: no upstream \"%V\"", upstream_name);
-        return NULL;
-    }
-
-    return uscfp[i];
+    return NULL;
 }
 
 
@@ -1262,7 +1247,7 @@ ngx_http_upconf_parse_dump_file(ngx_http_upstream_srv_conf_t *uscf,
             prev++;
         }
 
-        ngx_http_upconf_add_peer(&r, &server);
+        ngx_http_upconf_add_peer(&r, &server, uscf);
     }
     ngx_fclose(fp);
 
